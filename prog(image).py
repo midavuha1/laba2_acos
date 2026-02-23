@@ -1,12 +1,22 @@
 import threading
 import time
 import os
+import logging
 import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Tuple
-from PIL import Image
+from PIL import Image, ImageDraw
 from collections import deque
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('image_processor.log', encoding='utf-8')
+    ]
+)
+logger = logging.getLogger()
 
 
 class FilterType(Enum):
@@ -23,6 +33,7 @@ class ImageTask:
     input_path: str
     output_path: str
     filter_type: FilterType
+
 
 @dataclass
 class ImageResult:
@@ -103,7 +114,6 @@ class ImageProcessor:
 
     @classmethod
     def apply_filter(cls, pixels, width, height, filter_type: FilterType, start_x=0, start_y=0, end_x=None, end_y=None):
-
         if end_x is None:
             end_x = width
         if end_y is None:
@@ -127,6 +137,8 @@ class ImageProcessor:
                     new_rgb = cls.sepia_pixel(r, g, b)
                 elif filter_type == FilterType.CONTRAST:
                     new_rgb = cls.contrast_pixel(r, g, b)
+                else:
+                    new_rgb = (r, g, b)
 
                 new_pixels.append(new_rgb)
 
@@ -134,7 +146,8 @@ class ImageProcessor:
 
 
 class Producer(threading.Thread):
-    def __init__(self, task_queue: BlockingQueue, image_files: List[str], output_dir: str, filter_type: FilterType, poison_pills_count: int):
+    def __init__(self, task_queue: BlockingQueue, image_files: List[str], output_dir: str, filter_type: FilterType,
+                 poison_pills_count: int):
         super().__init__()
         self.task_queue = task_queue
         self.image_files = image_files
@@ -163,13 +176,15 @@ class Producer(threading.Thread):
 
                 self.task_queue.put(task)
                 self.processed_count += 1
+                logger.info(f"Producer added task: {base_name}")
 
         except Exception as e:
-            print(f"Error in Producer: {e}")
+            logger.error(f"Error in Producer: {e}")
 
         finally:
             for i in range(self.poison_pills_count):
                 self.task_queue.put(None)
+            logger.info(f"Producer finished. Added {self.processed_count} tasks")
 
 
 class Consumer(threading.Thread):
@@ -182,16 +197,28 @@ class Consumer(threading.Thread):
         self.running = True
 
     def run(self):
+        logger.info(f"Consumer {self.consumer_id} launched")
+
         while True:
             try:
                 task = self.task_queue.get()
 
                 if task is None:
+                    logger.info(f"Consumer {self.consumer_id} received poison pill, stopping")
                     break
+
+                logger.info(f"Consumer {self.consumer_id} processing: {os.path.basename(task.input_path)}")
 
                 start_time = time.time()
                 success, error_msg = self.process_image(task)
                 proc_time = time.time() - start_time
+
+                if success:
+                    logger.info(
+                        f"Consumer {self.consumer_id} completed: {os.path.basename(task.input_path)} in {proc_time:.2f}s")
+                else:
+                    logger.error(
+                        f"Consumer {self.consumer_id} error processing {os.path.basename(task.input_path)}: {error_msg}")
 
                 result = ImageResult(
                     task_id=task.task_id,
@@ -205,7 +232,7 @@ class Consumer(threading.Thread):
                 self.processed_count += 1
 
             except Exception as e:
-                print(f"Error in Consumer-{self.consumer_id}: {e}")
+                logger.error(f"Error in Consumer-{self.consumer_id}: {e}")
                 continue
 
     def process_image(self, task: ImageTask):
@@ -218,7 +245,7 @@ class Consumer(threading.Thread):
                 width, height = img.size
 
                 if task.filter_type == FilterType.BLUR:
-                    new_pixels = self.apply_gaussian_blur(pixels, width, height, radius=4.0)
+                    new_pixels = self.apply_gaussian_blur(pixels, width, height, radius=2.0)
                 else:
                     new_pixels = ImageProcessor.apply_filter(
                         pixels, width, height, task.filter_type
@@ -227,14 +254,14 @@ class Consumer(threading.Thread):
                 new_img = Image.new('RGB', (width, height))
                 new_img.putdata(new_pixels)
 
-                new_img.save(task.output_path, 'PNG')
+                new_img.save(task.output_path, 'PNG', optimize=True)
 
                 return True, ""
 
         except Exception as e:
             return False, str(e)
 
-    def apply_gaussian_blur(self, pixels, width, height, radius=4.0):
+    def apply_gaussian_blur(self, pixels, width, height, radius=2.0):
         kernel_size = int(2 * radius + 1)
         if kernel_size % 2 == 0:
             kernel_size += 1
@@ -340,10 +367,12 @@ class ResultsCollector(threading.Thread):
 
     def run(self):
         completed = 0
-        max_wait = 10
+        max_wait = 30
         start_time = time.time()
+
         while completed < self.total_tasks:
             if time.time() - start_time > max_wait:
+                logger.warning(f"Results collector timeout. Collected {completed}/{self.total_tasks} results")
                 break
 
             try:
@@ -355,65 +384,103 @@ class ResultsCollector(threading.Thread):
             except Exception:
                 continue
 
+        logger.info(f"Results collector finished. Collected {len(self.results)} results")
 
-def find_images(directory: str, extensions=None) -> List[str]:
-    if extensions is None:
-        extensions = ['.jpg', '.jpeg', '.png']
+
+def find_images(directory: str) -> List[str]:
+    extensions = {'.jpg', '.jpeg', '.png'}
     images = []
+
+    if not os.path.exists(directory):
+        return images
+
     for file in os.listdir(directory):
-        if any(file.lower().endswith(ext) for ext in extensions):
+        ext = os.path.splitext(file)[1].lower()
+        if ext in extensions:
             images.append(os.path.join(directory, file))
-    return images
+
+    return sorted(images)
+
+
+def create_test_images(count: int, directory: str):
+    os.makedirs(directory, exist_ok=True)
+
+    colors = ['red', 'green', 'blue', 'yellow', 'purple', 'orange']
+
+    for i in range(count):
+        img_path = os.path.join(directory, f"test_image_{i + 1}.png")
+
+        img = Image.new('RGB', (800, 600), color='white')
+        draw = ImageDraw.Draw(img)
+
+        color = colors[i % len(colors)]
+        draw.rectangle([100, 100, 700, 500], fill=color, outline='black', width=5)
+        draw.text((350, 280), f"Test Image {i + 1}", fill='black')
+
+        img.save(img_path)
+        logger.info(f"Created test image: {img_path}")
 
 
 def print_results_summary(results: List[ImageResult]):
     successful = sum(1 for r in results if r.success)
     failed = len(results) - successful
 
-    print(f"\nProcessing completed:")
-    print(f"  Successfully processed: {successful}")
-    print(f"  Failed: {failed}")
+    print(f"\nTotal tasks: {len(results)}")
+    print(f"Successfully: {successful}")
+    print(f"Errors: {failed}")
+
+    if failed > 0:
+        print("\nErrors:")
+        for result in results:
+            if not result.success:
+                print(f"  - {os.path.basename(result.output_path)}: {result.error_message}")
 
 
 def main():
     INPUT_DIR = "./input_images"
     OUTPUT_DIR = "./output_images"
-    NUM_CONSUMERS = 4
 
     print("\nAvailable filters:")
-    for i, filter_type in enumerate(FilterType):
-        print(f"  {i + 1}. {filter_type.value}")
+    filters = list(FilterType)
+    for i, filter_type in enumerate(filters, 1):
+        print(f"  {i}. {filter_type.value}")
 
-    choice = input("\nSelect the filter to process: ").strip()
+    try:
+        choice = int(input("\nSelect a filter (1-5): ").strip())
+        selected_filter = filters[choice - 1]
+    except (ValueError, IndexError):
+        selected_filter = FilterType.INVERT
+        print(f"Using default filter: {selected_filter.value}")
 
-    filter_map = {
-        '1': FilterType.INVERT,
-        '2': FilterType.GRAYSCALE,
-        '3': FilterType.SEPIA,
-        '4': FilterType.BLUR,
-        '5': FilterType.CONTRAST
-    }
+    print(f"Selected filter: {selected_filter.value}")
 
-    selected_filter = filter_map.get(choice, FilterType)
-    print(f"The filter is selected: {selected_filter.value}")
-
-    if not os.path.exists(INPUT_DIR):
-        os.makedirs(INPUT_DIR, exist_ok=True)
-        create_test_image(os.path.join(INPUT_DIR, "test_image.png"))
+    os.makedirs(INPUT_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     images = find_images(INPUT_DIR)
 
     if not images:
-        create_test_image(os.path.join(INPUT_DIR, "test_image.png"))
+        print("\nNo images found in input folder. Creating test images...")
+        create_test_images(5, INPUT_DIR)
         images = find_images(INPUT_DIR)
 
-    task_queue = BlockingQueue(maxsize=10)
+    print(f"\nFound {len(images)} images")
+
+    try:
+        num_consumers = int(input(f"\nHow many consumers to use? (1-10, default 4): ") or 4)
+        num_consumers = max(1, min(num_consumers, 10))
+    except ValueError:
+        num_consumers = 4
+
+    print(f"Using {num_consumers} consumers")
+
+    task_queue = BlockingQueue(maxsize=num_consumers * 2)
     results_queue = BlockingQueue()
 
-    producer = Producer(task_queue, images, OUTPUT_DIR, selected_filter, NUM_CONSUMERS)
+    producer = Producer(task_queue, images, OUTPUT_DIR, selected_filter, num_consumers)
 
     consumers = []
-    for i in range(NUM_CONSUMERS):
+    for i in range(num_consumers):
         consumer = Consumer(i, task_queue, results_queue)
         consumers.append(consumer)
 
@@ -427,11 +494,14 @@ def main():
     producer.start()
 
     producer.join()
+    logger.info("Producer finished")
 
     for consumer in consumers:
         consumer.join()
+    logger.info("All consumers finished")
 
     collector.join()
+    logger.info("Collector finished")
 
     total_time = time.time() - start_time
 
@@ -440,21 +510,10 @@ def main():
     print(f"Results saved in: {OUTPUT_DIR}/")
 
 
-def create_test_image(path: str):
-    from PIL import Image, ImageDraw
-
-    img = Image.new('RGB', (400, 300), color='lightgray')
-    draw = ImageDraw.Draw(img)
-
-    draw.rectangle([50, 50, 150, 150], fill='red', outline='black')
-    draw.rectangle([200, 50, 300, 150], fill='green', outline='black')
-    draw.rectangle([50, 180, 150, 280], fill='blue', outline='black')
-    draw.rectangle([200, 180, 300, 280], fill='yellow', outline='black')
-
-    draw.text((160, 10), "Test Image", fill='black')
-
-    img.save(path)
-
-
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nProgram interrupted by user")
+    except Exception as e:
+        logger.exception("Critical error in main")
